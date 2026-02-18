@@ -1,2 +1,28 @@
+# Environment / secrets
 .env
+
+# Python
 *.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Type checker / linter config
+pyrightconfig.json
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Cursor
+.cursor/
+
+# Testing
+testing/
