@@ -226,17 +226,60 @@ def _salvage_orphaned_running_trials(
             )
             continue
 
+        # Capture per-stage metrics from the original trial so the salvaged
+        # trial can replay completed stages without re-training. Without this,
+        # a salvaged trial whose checkpoint sits at e.g. epoch=4 would re-enter
+        # stage 1 (num_epochs=1) and the trainer would compute
+        # ``range(start_epoch=4, epochs=1)`` -> empty -> silently skip training.
+        cached_stage_val_losses: dict[int, float] = {}
+        cached_stage_objective_scores: dict[int, float] = {}
+        cached_stage_runtime_hours: dict[int, float] = {}
+        cached_stage_num_epochs: dict[int, int] = {}
+        cached_stage_sample_percent: dict[int, float] = {}
+        cached_stage_valid_sample_percent: dict[int, float] = {}
+        cached_stage_eval_every_n_epochs: dict[int, int] = {}
+        for s in range(1, last_recorded_stage + 1):
+            v = trial.user_attrs.get(f"stage_{s}_val_loss")
+            if isinstance(v, (int, float)):
+                cached_stage_val_losses[s] = float(v)
+            o = trial.user_attrs.get(f"stage_{s}_objective_score")
+            if isinstance(o, (int, float)):
+                cached_stage_objective_scores[s] = float(o)
+            r = trial.user_attrs.get(f"stage_{s}_runtime_hours")
+            if isinstance(r, (int, float)):
+                cached_stage_runtime_hours[s] = float(r)
+            ne = trial.user_attrs.get(f"stage_{s}_num_epochs")
+            if isinstance(ne, (int, float)):
+                cached_stage_num_epochs[s] = int(ne)
+            sp = trial.user_attrs.get(f"stage_{s}_sample_percent")
+            if isinstance(sp, (int, float)):
+                cached_stage_sample_percent[s] = float(sp)
+            vsp = trial.user_attrs.get(f"stage_{s}_valid_sample_percent")
+            if isinstance(vsp, (int, float)):
+                cached_stage_valid_sample_percent[s] = float(vsp)
+            eee = trial.user_attrs.get(f"stage_{s}_eval_every_n_epochs")
+            if isinstance(eee, (int, float)):
+                cached_stage_eval_every_n_epochs[s] = int(eee)
+
         params_key = _hashable_params(trial.params)
         salvage_hints[params_key] = {
             "original_trial_number": trial.number,
             "last_recorded_stage": last_recorded_stage,
             "resume_output_dir": last_output_dir,
+            "stage_val_losses": cached_stage_val_losses,
+            "stage_objective_scores": cached_stage_objective_scores,
+            "stage_runtime_hours": cached_stage_runtime_hours,
+            "stage_num_epochs": cached_stage_num_epochs,
+            "stage_sample_percent": cached_stage_sample_percent,
+            "stage_valid_sample_percent": cached_stage_valid_sample_percent,
+            "stage_eval_every_n_epochs": cached_stage_eval_every_n_epochs,
         }
         salvaged_count += 1
         print(
             f"[sweep][salvage] orphan trial {trial.number}: marked FAIL, "
             f"re-enqueued with identical params. Last completed stage: "
-            f"{last_recorded_stage}, resume from: {last_output_dir or '<none>'}"
+            f"{last_recorded_stage}, resume from: {last_output_dir or '<none>'} "
+            f"(cached {len(cached_stage_val_losses)} stage val_loss values to replay)"
         )
 
     if salvaged_count:
@@ -329,6 +372,20 @@ def _build_stage_schedule(max_epochs: int) -> list[dict]:
             }
         )
         prev_epochs = epoch_budget
+
+    # Each stage's "step weight" approximates its contribution to the total
+    # optimizer-step budget: epochs_in_stage * train_sample_fraction. The
+    # absolute scale cancels out when we use it as a per-stage multiplier
+    # over the local stage_total_optimizer_steps.
+    stage_weights = [
+        max(1e-9, stage["num_epochs"] * stage["sample_percent"])
+        for stage in stages
+    ]
+    total_weight = sum(stage_weights)
+    for stage, weight in zip(stages, stage_weights):
+        stage["lr_scheduler_lifetime_multiplier"] = (
+            float(total_weight / weight) if weight > 0 else 1.0
+        )
     return stages
 
 
@@ -516,24 +573,26 @@ def read_stage_quality_metrics(output_dir: str) -> dict[str, float | None]:
 def _build_stage_config(base_config: SAM3LoRAConfig, trial_overrides: dict, stage_cfg: dict, trial_number: int, stage_idx: int) -> dict:
     config_dict = copy.deepcopy(base_config.model_dump(mode="json"))
     _deep_merge(config_dict, trial_overrides)
-    _deep_merge(
-        config_dict,
-        {
-            "training": {
-                "data": {
-                    "sample_percent": stage_cfg["sample_percent"],
-                    "valid_sample_percent": stage_cfg["valid_sample_percent"],
-                    "valid_sample_seed": 42,
-                },
-                "num_epochs": stage_cfg["num_epochs"],
-                "eval_steps": SWEEP_EVAL_STEPS,
-                "eval_every_n_epochs": stage_cfg["eval_every_n_epochs"],
+    stage_overrides: dict[str, Any] = {
+        "training": {
+            "data": {
+                "sample_percent": stage_cfg["sample_percent"],
+                "valid_sample_percent": stage_cfg["valid_sample_percent"],
+                "valid_sample_seed": 42,
             },
-            "output": {
-                "output_dir": f"outputs/final_optuna_asha/trial_{trial_number:04d}",
-            },
+            "num_epochs": stage_cfg["num_epochs"],
+            "eval_steps": SWEEP_EVAL_STEPS,
+            "eval_every_n_epochs": stage_cfg["eval_every_n_epochs"],
         },
-    )
+        "output": {
+            "output_dir": f"outputs/final_optuna_asha/trial_{trial_number:04d}",
+        },
+    }
+    if "lr_scheduler_lifetime_multiplier" in stage_cfg:
+        stage_overrides["training"]["lr_scheduler_lifetime_multiplier"] = float(
+            stage_cfg["lr_scheduler_lifetime_multiplier"]
+        )
+    _deep_merge(config_dict, stage_overrides)
     return config_dict
 
 
@@ -573,32 +632,85 @@ def _objective_factory(
         resume_output_dir = (
             salvage["resume_output_dir"] if salvage is not None else None
         )
+        # For salvaged trials: replay stages already completed in the original
+        # trial without re-training. The original ran num_epochs cumulatively,
+        # so its final checkpoint already contains weights for those stages.
+        # Re-running stage 1 (num_epochs=1) against a checkpoint at e.g. epoch=4
+        # would make ``range(start_epoch=4, epochs=1)`` empty -> trainer no-ops.
+        salvage_last_recorded_stage = (
+            int(salvage["last_recorded_stage"]) if salvage is not None else 0
+        )
+        salvage_stage_val_losses = (
+            salvage.get("stage_val_losses", {}) if salvage is not None else {}
+        )
+        salvage_stage_objective_scores = (
+            salvage.get("stage_objective_scores", {}) if salvage is not None else {}
+        )
+        salvage_stage_runtime_hours = (
+            salvage.get("stage_runtime_hours", {}) if salvage is not None else {}
+        )
+
         for stage_idx, stage_cfg in enumerate(stage_schedule, start=1):
-            stage_config = _build_stage_config(
-                base_config=base_config,
-                trial_overrides=trial_overrides,
-                stage_cfg=stage_cfg,
-                trial_number=trial.number,
-                stage_idx=stage_idx,
+            replay_from_salvage = (
+                salvage is not None and stage_idx <= salvage_last_recorded_stage
             )
 
-            stage_start_time = time.perf_counter()
-            # `fresh_run` only applies on stage 1, AND only when we don't
-            # have a salvage checkpoint to resume from. With a resume hint
-            # we want train_sam3 to attach to the existing run dir.
-            run_result = train_sam3.remote(
-                stage_config,
-                fresh_run=(stage_idx == 1) and (resume_output_dir is None),
-                resume_output_dir=resume_output_dir,
-            )
-            stage_runtime_hours = (time.perf_counter() - stage_start_time) / 3600.0
-            cumulative_stage_runtime_hours += stage_runtime_hours
-            resume_output_dir = run_result["output_dir"]
-            stage_val_loss = read_latest_val_loss.remote(run_result["output_dir"])
+            if replay_from_salvage:
+                assert salvage is not None  # narrow for type-checkers
+                cached_val = salvage_stage_val_losses.get(stage_idx)
+                cached_rt = salvage_stage_runtime_hours.get(stage_idx)
+
+                if isinstance(cached_val, (int, float)):
+                    stage_val_loss = float(cached_val)
+                else:
+                    # Original trial somehow lost its per-stage val_loss;
+                    # fall back to the latest val written into the salvage dir.
+                    stage_val_loss = float(
+                        read_latest_val_loss.remote(salvage["resume_output_dir"])
+                    )
+
+                stage_runtime_hours = (
+                    float(cached_rt) if isinstance(cached_rt, (int, float)) else 0.0
+                )
+                cumulative_stage_runtime_hours += stage_runtime_hours
+                run_output_dir = salvage["resume_output_dir"]
+                resume_output_dir = run_output_dir
+                print(
+                    f"[sweep][salvage] trial {trial.number} stage {stage_idx}: "
+                    f"replaying cached val_loss={stage_val_loss:.6f} from original "
+                    f"trial {salvage['original_trial_number']} "
+                    f"(no retraining; checkpoint already covers this rung)."
+                )
+            else:
+                stage_config = _build_stage_config(
+                    base_config=base_config,
+                    trial_overrides=trial_overrides,
+                    stage_cfg=stage_cfg,
+                    trial_number=trial.number,
+                    stage_idx=stage_idx,
+                )
+
+                stage_start_time = time.perf_counter()
+                # `fresh_run` only applies on stage 1, AND only when we don't
+                # have a salvage checkpoint to resume from. With a resume hint
+                # we want train_sam3 to attach to the existing run dir.
+                run_result = train_sam3.remote(
+                    stage_config,
+                    fresh_run=(stage_idx == 1) and (resume_output_dir is None),
+                    resume_output_dir=resume_output_dir,
+                )
+                stage_runtime_hours = (
+                    time.perf_counter() - stage_start_time
+                ) / 3600.0
+                cumulative_stage_runtime_hours += stage_runtime_hours
+                resume_output_dir = run_result["output_dir"]
+                run_output_dir = run_result["output_dir"]
+                stage_val_loss = read_latest_val_loss.remote(run_output_dir)
+
             best_stage_val_loss = min(best_stage_val_loss, stage_val_loss)
             final_stage_val_loss = stage_val_loss
 
-            trial.set_user_attr(f"stage_{stage_idx}_output_dir", run_result["output_dir"])
+            trial.set_user_attr(f"stage_{stage_idx}_output_dir", run_output_dir)
             trial.set_user_attr(f"stage_{stage_idx}_sample_percent", stage_cfg["sample_percent"])
             trial.set_user_attr(
                 f"stage_{stage_idx}_valid_sample_percent",
@@ -611,8 +723,14 @@ def _objective_factory(
             trial.set_user_attr(f"stage_{stage_idx}_num_epochs", stage_cfg["num_epochs"])
             trial.set_user_attr(f"stage_{stage_idx}_val_loss", stage_val_loss)
             trial.set_user_attr(f"stage_{stage_idx}_runtime_hours", stage_runtime_hours)
+            if replay_from_salvage:
+                assert salvage is not None  # narrow for type-checkers
+                trial.set_user_attr(
+                    f"stage_{stage_idx}_salvaged_from_trial",
+                    salvage["original_trial_number"],
+                )
             try:
-                stage_metrics = read_stage_quality_metrics.remote(run_result["output_dir"])
+                stage_metrics = read_stage_quality_metrics.remote(run_output_dir)
                 metric_f1 = stage_metrics.get("f1")
                 metric_quality = stage_metrics.get("composite")
                 if isinstance(metric_f1, (int, float)):
@@ -622,9 +740,24 @@ def _objective_factory(
             except Exception as exc:
                 trial.set_user_attr(f"stage_{stage_idx}_metrics_error", str(exc))
 
-            stage_score = stage_val_loss
-            if normalized_mode == "cost_aware":
-                stage_score = stage_val_loss + cost_penalty_per_gpu_hour * cumulative_stage_runtime_hours
+            if replay_from_salvage:
+                cached_score = salvage_stage_objective_scores.get(stage_idx)
+                if isinstance(cached_score, (int, float)):
+                    stage_score = float(cached_score)
+                elif normalized_mode == "cost_aware":
+                    stage_score = (
+                        stage_val_loss
+                        + cost_penalty_per_gpu_hour * cumulative_stage_runtime_hours
+                    )
+                else:
+                    stage_score = stage_val_loss
+            else:
+                stage_score = stage_val_loss
+                if normalized_mode == "cost_aware":
+                    stage_score = (
+                        stage_val_loss
+                        + cost_penalty_per_gpu_hour * cumulative_stage_runtime_hours
+                    )
             trial.set_user_attr(f"stage_{stage_idx}_objective_score", stage_score)
             trial.report(stage_score, step=stage_idx)
 

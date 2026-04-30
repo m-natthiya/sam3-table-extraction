@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import time
 import urllib.request
 from dataclasses import dataclass
 import sqlite3
@@ -221,17 +222,49 @@ def _select_detection_subset(
     items: list[DetectionImage],
     dataset_fraction: float,
     sample_seed: int | None,
+    holdout_train_fraction: float = 0.0,
+    holdout_train_seed: int | None = None,
 ) -> list[DetectionImage]:
-    if dataset_fraction >= 1.0 or not items:
-        return items
+    """Pick the subset of detection images to evaluate on.
 
-    subset_size = max(1, int(len(items) * dataset_fraction))
+    When ``holdout_train_fraction > 0``, this first reproduces the trainer's
+    split logic (``random.Random(holdout_train_seed).sample`` over the COCO
+    image ids sorted ascending) to recover the exact set of training images,
+    then EXCLUDES them so eval runs only on the held-out complement. After
+    that, ``dataset_fraction`` / ``sample_seed`` further subsamples the
+    remaining items if requested.
+    """
+    working_items = items
+
+    if holdout_train_fraction > 0.0:
+        if holdout_train_fraction >= 1.0:
+            raise ValueError(
+                "holdout_train_fraction must be < 1.0 (otherwise the held-out "
+                "complement is empty)."
+            )
+        if holdout_train_seed is None:
+            raise ValueError(
+                "holdout_train_seed is required when holdout_train_fraction > 0."
+            )
+        sorted_ids = sorted(item.image_id for item in working_items)
+        k = max(1, int(len(sorted_ids) * holdout_train_fraction))
+        train_ids = set(random.Random(holdout_train_seed).sample(sorted_ids, k))
+        working_items = [item for item in working_items if item.image_id not in train_ids]
+        if not working_items:
+            raise ValueError(
+                "Holdout filter removed every image; nothing left to evaluate."
+            )
+
+    if dataset_fraction >= 1.0 or not working_items:
+        return working_items
+
+    subset_size = max(1, int(len(working_items) * dataset_fraction))
     if sample_seed is None:
-        return items[:subset_size]
+        return working_items[:subset_size]
 
     rng = random.Random(sample_seed)
-    selected_indices = sorted(rng.sample(range(len(items)), k=subset_size))
-    return [items[idx] for idx in selected_indices]
+    selected_indices = sorted(rng.sample(range(len(working_items)), k=subset_size))
+    return [working_items[idx] for idx in selected_indices]
 
 
 def _load_config(
@@ -538,6 +571,10 @@ def run_tablebank_eval_on_current_leader(
     query_text: str = "table",
     batch_size: int = 8,
     visualize_max_images: int = 20,
+    dataset_fraction: float = 1.0,
+    sample_seed: int | None = None,
+    duplicate_iou_threshold: float = 0.5,
+    min_box_area: float = 16.0,
     include_running_trials: bool = True,
     sqlite_lock_timeout_sec: int = 60,
     num_rung_stages: int = DEFAULT_NUM_RUNG_STAGES,
@@ -564,6 +601,10 @@ def run_tablebank_eval_on_current_leader(
         query_text=query_text,
         batch_size=batch_size,
         visualize_max_images=visualize_max_images,
+        dataset_fraction=dataset_fraction,
+        sample_seed=sample_seed,
+        duplicate_iou_threshold=duplicate_iou_threshold,
+        min_box_area=min_box_area,
     )
     result["leader"] = leader
     result["benchmark_output_dir"] = leader_output_dir
@@ -614,6 +655,8 @@ def run_tablebank_eval(
     unique_output_dir: bool = False,
     dataset_fraction: float = 1.0,
     sample_seed: int | None = None,
+    holdout_train_fraction: float = 0.0,
+    holdout_train_seed: int | None = None,
     duplicate_iou_threshold: float = 0.5,
     min_box_area: float = 16.0,
     query_text: str = "table",
@@ -639,8 +682,16 @@ def run_tablebank_eval(
 
     from sam3_table.model_builder import build_sam3_image_model
 
+    eval_start_time = time.monotonic()
+
+    def _log_step(message: str) -> None:
+        elapsed = time.monotonic() - eval_start_time
+        print(f"[eval +{elapsed:6.1f}s] {message}", flush=True)
+
+    _log_step("reloading modal volumes")
     tablebank_vol.reload()
     artifacts_vol.reload()
+    _log_step("volumes reloaded")
 
     dataset_root_path = Path(dataset_root)
     annotations_root_path = Path(annotations_path)
@@ -670,8 +721,14 @@ def run_tablebank_eval(
     else:
         resolved_annotations_path = resolved_annotations_input
 
+    _log_step(f"loading COCO annotations from {resolved_annotations_path}")
     coco_dataset = COCODataset.from_json(resolved_annotations_path)
+    _log_step(
+        f"loaded COCO annotations: {len(coco_dataset.images)} images, "
+        f"{len(coco_dataset.annotations)} annotations"
+    )
 
+    _log_step(f"indexing image files under {dataset_root_path}")
     image_lookup: dict[str, Path] = {}
     image_root = dataset_root_path / "images"
     if image_root.exists():
@@ -682,6 +739,7 @@ def run_tablebank_eval(
         for path in dataset_root_path.rglob("*"):
             if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
                 image_lookup[path.name] = path
+    _log_step(f"indexed {len(image_lookup)} image files")
 
     detection_images: list[DetectionImage] = []
     missing_files: list[str] = []
@@ -711,7 +769,15 @@ def run_tablebank_eval(
         detection_images,
         dataset_fraction=dataset_fraction,
         sample_seed=sample_seed,
+        holdout_train_fraction=holdout_train_fraction,
+        holdout_train_seed=holdout_train_seed,
     )
+    if holdout_train_fraction > 0.0:
+        _log_step(
+            f"holdout filter applied: excluded train sample of "
+            f"{holdout_train_fraction:.4f} (seed={holdout_train_seed}); "
+            f"{len(detection_images)} images remain for eval"
+        )
 
     selected_image_ids = {item.image_id for item in detection_images}
     selected_annotations = [
@@ -805,7 +871,12 @@ def run_tablebank_eval(
         return encoded, pred_id
 
     device_obj = _resolve_device("cuda" if torch.cuda.is_available() else "cpu")
+    _log_step(f"resolved device: {device_obj}")
     config = _load_config(resolved_weights_path, None)
+    _log_step(
+        "building SAM3 image model "
+        "(load_from_HF=True; first run downloads HF weights)"
+    )
     model = build_sam3_image_model(
         device=device_obj.type,
         compile=False,
@@ -813,6 +884,7 @@ def run_tablebank_eval(
         bpe_path=resolve_bpe_vocab_path(),
         eval_mode=True,
     )
+    _log_step("SAM3 base model built")
     lora_cfg = config.lora
     model = apply_lora_to_model(
         model,
@@ -829,17 +901,23 @@ def run_tablebank_eval(
             apply_to_mask_decoder=lora_cfg.apply_to_mask_decoder,
         ),
     )
+    _log_step(f"loading LoRA weights from {resolved_weights_path}")
     lora_state_dict = torch.load(resolved_weights_path, map_location=device_obj)
     model.load_state_dict(lora_state_dict, strict=False)
+    _log_step(f"moving model to {device_obj}")
     model.to(device_obj)
     model.eval()
+    _log_step("model ready on device; starting inference loop")
 
     normalized_query = query_text.strip().lower() or "table"
     dataset = _TableBankInferenceDataset(detection_images, normalized_query)
     predictions: list[dict[str, Any]] = []
     next_prediction_id = 0
+    total_batches = (len(dataset) + batch_size - 1) // batch_size
+    log_every_batches = max(1, total_batches // 20)
+    inference_start_time = time.monotonic()
 
-    for start in range(0, len(dataset), batch_size):
+    for batch_idx, start in enumerate(range(0, len(dataset), batch_size)):
         end = min(start + batch_size, len(dataset))
         batch_items = detection_images[start:end]
         batch = collate_fn_api(
@@ -882,6 +960,17 @@ def run_tablebank_eval(
         )
         predictions.extend(encoded_batch)
 
+        completed = batch_idx + 1
+        if completed == 1 or completed % log_every_batches == 0 or completed == total_batches:
+            inference_elapsed = time.monotonic() - inference_start_time
+            images_done = min(completed * batch_size, len(dataset))
+            rate = images_done / max(inference_elapsed, 1e-6)
+            _log_step(
+                f"inference batch {completed}/{total_batches} "
+                f"({images_done}/{len(dataset)} images, {rate:.2f} img/s)"
+            )
+
+    _log_step(f"inference complete; {len(predictions)} predictions collected")
     predictions_path = output_dir_path / "predictions.coco.json"
     predictions_path.write_text(json.dumps(predictions, indent=2, default=_json_default))
 
@@ -941,6 +1030,8 @@ def run_tablebank_eval(
         "unique_output_dir": unique_output_dir,
         "dataset_fraction": dataset_fraction,
         "sample_seed": sample_seed,
+        "holdout_train_fraction": holdout_train_fraction,
+        "holdout_train_seed": holdout_train_seed,
         "query_text": normalized_query,
         "model": {
             "family": "sam3",
@@ -960,6 +1051,8 @@ def run_tablebank_eval(
             "score_threshold": score_threshold,
             "dataset_fraction": dataset_fraction,
             "sample_seed": sample_seed,
+            "holdout_train_fraction": holdout_train_fraction,
+            "holdout_train_seed": holdout_train_seed,
             "visualize_max_images": visualize_max_images,
         },
         "parameters": {
@@ -994,6 +1087,8 @@ def main(
     unique_output_dir: bool = False,
     dataset_fraction: float = 1.0,
     sample_seed: int | None = None,
+    holdout_train_fraction: float = 0.0,
+    holdout_train_seed: int | None = None,
     duplicate_iou_threshold: float = 0.5,
     min_box_area: float = 16.0,
     query_text: str = "table",
@@ -1006,21 +1101,6 @@ def main(
     num_rung_stages: int = DEFAULT_NUM_RUNG_STAGES,
     show_current_leader_only: bool = False,
 ):
-    result = run_tablebank_eval.remote(
-        weights_path=weights,
-        dataset_root=dataset_root,
-        annotations_path=annotations,
-        output_dir=output_dir,
-        score_threshold=score_threshold,
-        duplicate_iou_threshold=duplicate_iou_threshold,
-        min_box_area=min_box_area,
-        unique_output_dir=unique_output_dir,
-        dataset_fraction=dataset_fraction,
-        sample_seed=sample_seed,
-        query_text=query_text,
-        batch_size=batch_size,
-        visualize_max_images=visualize_max_images,
-    )
     if show_current_leader_only:
         result = describe_current_leader.remote(
             study_name=study_name,
@@ -1038,6 +1118,10 @@ def main(
             query_text=query_text,
             batch_size=batch_size,
             visualize_max_images=visualize_max_images,
+            dataset_fraction=dataset_fraction,
+            sample_seed=sample_seed,
+            duplicate_iou_threshold=duplicate_iou_threshold,
+            min_box_area=min_box_area,
             include_running_trials=include_running_trials,
             sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
             num_rung_stages=num_rung_stages,
@@ -1053,6 +1137,13 @@ def main(
             annotations_path=annotations,
             output_dir=output_dir,
             score_threshold=score_threshold,
+            unique_output_dir=unique_output_dir,
+            dataset_fraction=dataset_fraction,
+            sample_seed=sample_seed,
+            holdout_train_fraction=holdout_train_fraction,
+            holdout_train_seed=holdout_train_seed,
+            duplicate_iou_threshold=duplicate_iou_threshold,
+            min_box_area=min_box_area,
             query_text=query_text,
             batch_size=batch_size,
             visualize_max_images=visualize_max_images,

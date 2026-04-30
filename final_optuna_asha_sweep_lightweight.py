@@ -255,6 +255,16 @@ def _build_stage_schedule(max_epochs: int) -> list[dict[str, float | int]]:
             }
         )
         prev_epochs = epoch_budget
+
+    stage_weights = [
+        max(1e-9, stage["num_epochs"] * stage["sample_percent"])
+        for stage in stages
+    ]
+    total_weight = sum(stage_weights)
+    for stage, weight in zip(stages, stage_weights):
+        stage["lr_scheduler_lifetime_multiplier"] = (
+            float(total_weight / weight) if weight > 0 else 1.0
+        )
     return stages
 
 
@@ -358,22 +368,24 @@ def _build_stage_config(
 ) -> dict[str, Any]:
     config_dict = copy.deepcopy(base_config.model_dump(mode="json"))
     _deep_merge(config_dict, trial_overrides)
-    _deep_merge(
-        config_dict,
-        {
-            "training": {
-                "data": {
-                    "sample_percent": stage_cfg["sample_percent"],
-                    "valid_sample_percent": stage_cfg["valid_sample_percent"],
-                    "valid_sample_seed": 42,
-                },
-                "num_epochs": stage_cfg["num_epochs"],
-                "eval_steps": SWEEP_EVAL_STEPS,
-                "eval_every_n_epochs": stage_cfg["eval_every_n_epochs"],
+    stage_overrides: dict[str, Any] = {
+        "training": {
+            "data": {
+                "sample_percent": stage_cfg["sample_percent"],
+                "valid_sample_percent": stage_cfg["valid_sample_percent"],
+                "valid_sample_seed": 42,
             },
-            "output": {"output_dir": f"outputs/final_optuna_asha_lightweight/trial_{trial_number:04d}"},
+            "num_epochs": stage_cfg["num_epochs"],
+            "eval_steps": SWEEP_EVAL_STEPS,
+            "eval_every_n_epochs": stage_cfg["eval_every_n_epochs"],
         },
-    )
+        "output": {"output_dir": f"outputs/final_optuna_asha_lightweight/trial_{trial_number:04d}"},
+    }
+    if "lr_scheduler_lifetime_multiplier" in stage_cfg:
+        stage_overrides["training"]["lr_scheduler_lifetime_multiplier"] = float(
+            stage_cfg["lr_scheduler_lifetime_multiplier"]
+        )
+    _deep_merge(config_dict, stage_overrides)
     return config_dict
 
 

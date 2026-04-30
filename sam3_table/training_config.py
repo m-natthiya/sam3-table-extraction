@@ -121,6 +121,21 @@ class TrainingConfig(BaseModel):
     num_epochs: int = Field(100, gt=0)
     warmup_steps: int = Field(200, ge=0)
     lr_scheduler: LRScheduler = LRScheduler.COSINE
+    lr_scheduler_lifetime_multiplier: Optional[float] = Field(
+        None,
+        gt=0,
+        description=(
+            "Multiplier applied to the current stage's ``total_optimizer_steps`` "
+            "when building the LR schedule. Set this when training is invoked "
+            "in stages so the scheduler curve is computed against the lifetime "
+            "step budget across all stages, instead of just the current "
+            "stage's ``num_epochs``. The sweep computes this from the "
+            "(num_epochs * sample_percent) ratios of the full schedule, so the "
+            "trainer does not need to know dataset size. Resumed scheduler "
+            "state from a previous stage's checkpoint then lines up with the "
+            "same underlying curve."
+        ),
+    )
 
     logging_steps: int = Field(10, gt=0)
     eval_steps: int = Field(100, gt=0)

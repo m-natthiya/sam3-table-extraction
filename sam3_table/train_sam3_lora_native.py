@@ -158,7 +158,15 @@ class COCOSegmentDataset(Dataset):
             import random
             rng = random.Random(seed)
             k = max(1, int(len(self.image_ids) * sample_percent / 100.0))
-            self.image_ids = sorted(rng.sample(self.image_ids, k))
+            # Use a stable rank ordering so nested ``sample_percent`` values
+            # produce nested subsets: the top-k images for k=10 are a strict
+            # subset of the top-k for k=30 when ``seed`` is unchanged. This
+            # matters for staged sweeps where each rung trains/validates on a
+            # progressively larger fraction of the dataset; without nesting,
+            # consecutive stages mostly throw away the previous stage's
+            # samples (``random.Random(seed).sample`` is independent in k).
+            ranked_ids = sorted(self.image_ids, key=lambda image_id: rng.random())
+            self.image_ids = sorted(ranked_ids[:k])
 
         # Build index: image_id -> list of annotations
         self.img_to_anns: dict[int, list] = {}
@@ -1282,7 +1290,35 @@ class SAM3TrainerNative:
 
         accum_steps = train_cfg.gradient_accumulation_steps
         optimizer_steps_per_epoch = (steps_per_epoch + accum_steps - 1) // accum_steps
-        total_optimizer_steps = max(1, epochs * optimizer_steps_per_epoch)
+        stage_total_optimizer_steps = max(1, epochs * optimizer_steps_per_epoch)
+        # When the caller (e.g. a staged sweep) provides a lifetime
+        # multiplier, build the LR schedule against the cumulative step
+        # budget instead of just the current stage's ``num_epochs``. This
+        # keeps the cosine/linear curve consistent across stages, so
+        # resuming scheduler state from a previous stage's checkpoint is
+        # meaningful (otherwise the ``current_step`` carried over from the
+        # previous schedule lands on a brand-new curve and produces the
+        # wrong LR for several hundred steps after each stage transition).
+        lifetime_multiplier = getattr(
+            train_cfg, "lr_scheduler_lifetime_multiplier", None
+        )
+        if (
+            lifetime_multiplier is not None
+            and float(lifetime_multiplier) > 0
+            and not math.isclose(float(lifetime_multiplier), 1.0)
+        ):
+            total_optimizer_steps = max(
+                stage_total_optimizer_steps,
+                int(round(stage_total_optimizer_steps * float(lifetime_multiplier))),
+            )
+            print_rank0(
+                f"Using cumulative LR schedule budget: stage_steps="
+                f"{stage_total_optimizer_steps}, lifetime_multiplier="
+                f"{float(lifetime_multiplier):.4f}, lifetime_steps="
+                f"{total_optimizer_steps}"
+            )
+        else:
+            total_optimizer_steps = stage_total_optimizer_steps
         self.scheduler = self._build_lr_scheduler(total_optimizer_steps)
 
         latest_ckpt = self.find_latest_checkpoint(out_dir)
